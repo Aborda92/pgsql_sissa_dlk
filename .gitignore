@@ -1,0 +1,12 @@
+# Carpetas de entorno y caché
+.venv/
+__pycache__/
+
+# Logs (toda la carpeta log, no solo los .log)
+/log/
+
+# Configuraciones sensibles
+/conf/config.json
+
+# Archivos de Docker auxiliares (opcional)
+.dockerignore
