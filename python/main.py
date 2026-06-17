@@ -6,28 +6,30 @@ import psycopg2
 from psycopg2.extras import execute_batch
 from datetime import datetime, timedelta
 
-# 1. Definir rutas y configuración de directorios
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_PATH = os.path.join(BASE_DIR, '..', 'conf', 'config.json')
 SQL_PATH = os.path.join(BASE_DIR, '..', 'sql', 'queries.sql')
 LOG_DIR = os.path.join(BASE_DIR, '..', 'log')
 
-# 2. Configurar el Logger ANTES de cualquier otra operación
 if not os.path.exists(LOG_DIR): 
     os.makedirs(LOG_DIR)
 
-logger = logging.getLogger("ETL_SISSA")
+with open(CONF_PATH, 'r') as f:
+    config = json.load(f)
+
+NOMBRE_PROCESO = config.get("PROCESS_NAME", "ETL_SISSA")
+
+logger = logging.getLogger(NOMBRE_PROCESO)
 logger.setLevel(logging.INFO)
 log_file = os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y-%m-%d')}.log")
 
 handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
 if not logger.handlers:
     logger.addHandler(handler)
     logger.addHandler(logging.StreamHandler())
 
-# 3. Borrar logs antiguos (más de 7 días)
 try:
     fecha_limite = datetime.now() - timedelta(days=7)
     for archivo in os.listdir(LOG_DIR):
@@ -39,58 +41,49 @@ try:
 except Exception as e:
     logger.warning(f"No se pudo limpiar logs antiguos: {e}")
 
-# 4. Cargar configuración
-with open(CONF_PATH) as f:
-    config = json.load(f)
-
+# Conexiones
 SRC_CONN = f"host={config['SRC']['HOST']} port={config['SRC']['PORT']} dbname={config['SRC']['DB']} user={config['SRC']['USER']} password={config['SRC']['PASS']}"
 DEST_CONN = f"host={config['DEST']['HOST']} port={config['DEST']['PORT']} dbname={config['DEST']['DB']} user={config['DEST']['USER']} password={config['DEST']['PASS']}"
 
-# 5. Cargar Queries desde archivo .sql
 queries = {}
 try:
     with open(SQL_PATH, 'r', encoding='utf-8') as f:
         current_key = None
         for line in f:
-            # Quitamos espacios laterales y saltos de línea (\r y \n)
             clean_line = line.strip()
-            
-            # Buscamos la etiqueta ignorando si hay espacios antes o después
             if clean_line.startswith("-- name:"):
-                # Extraemos el nombre y lo limpiamos de cualquier residuo
                 current_key = clean_line.replace("-- name:", "").strip()
                 queries[current_key] = ""
             elif current_key and clean_line:
-                # Si la línea no es una etiqueta, es parte del query
                 queries[current_key] += clean_line + " "
-    
-    # Debug: Imprimir lo que realmente cargó
-    logger.info(f"Queries cargadas: {list(queries.keys())}")
     
     if "QUERY_ULTIMA_FECHA" not in queries:
         raise ValueError("No se encontró la etiqueta QUERY_ULTIMA_FECHA")
-
 except Exception as e:
     logger.error(f"Error crítico cargando el archivo SQL: {e}")
     raise
 
 def procesar_ingesta():
+
+    logger.info("="*60)
+    logger.info(f"ARRANCANDO PROCESO: {NOMBRE_PROCESO}")
+    logger.info(f"Fecha de inicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*60)
+    
     try:
-        logger.info("--- INICIANDO NUEVA EJECUCIÓN BATCH ---")
-        
         with psycopg2.connect(DEST_CONN) as conn_dest, conn_dest.cursor() as cur_dest:
             cur_dest.execute(queries["QUERY_ULTIMA_FECHA"])
             res = cur_dest.fetchone()
             ultima_fecha = res[0] if res and res[0] else '1900-01-01'
             
-        logger.info(f"Buscando registros en Origen posteriores a: {ultima_fecha}")
+        logger.info(f"Buscando registros posteriores a: {ultima_fecha}")
 
         with psycopg2.connect(SRC_CONN) as conn_src, conn_src.cursor() as cur_src:
             cur_src.execute(queries["QUERY_EXTRACCION"], {"ultima_fecha": ultima_fecha})
             registros = cur_src.fetchall()
             
         if not registros:
-            logger.info("No hay registros nuevos para procesar.")
+            logger.info("No hay registros nuevos. Terminando.")
             logger.info("--- FIN DE LA EJECUCIÓN ---")
             return
 
@@ -101,7 +94,6 @@ def procesar_ingesta():
             id_o, tipo, fecha, cont, sol_id, prod_id = row
             c_json = json.loads(cont) if isinstance(cont, str) else cont
             
-            # Rescate multinivel
             base = c_json if "DatosSalida" in c_json else c_json.get("FullResponse", {})
             datos_salida = base.get("DatosSalida", {})
             datos_entrada = base.get("DatosEntrada", {})
