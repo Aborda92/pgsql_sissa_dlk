@@ -1,4 +1,3 @@
-# python/main.py
 import os
 import sys
 import json
@@ -6,26 +5,25 @@ import logging
 import argparse
 from datetime import datetime
 import psycopg2
-from psycopg2.extras import execute_batch
+from psycopg2.extras import execute_batch, DictCursor
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
-from transformations import parse_sissa_records
+import transformations
 
-def setup_logging(app_path, load_mode):
-
+def setup_logging(app_path, process_name):
     log_dir = os.path.join(app_path, 'logs')
     try:
         if not os.path.exists(log_dir): os.makedirs(log_dir)
-        archivos_log = [f for f in os.listdir(log_dir) if f.startswith('proceso_sissa_') and f.endswith('.log')]
+        archivos_log = [f for f in os.listdir(log_dir) if f.startswith(f'{process_name}_') and f.endswith('.log')]
         archivos_log.sort()
         while len(archivos_log) >= 7:
             os.remove(os.path.join(log_dir, archivos_log.pop(0)))
     except Exception as e:
         print(f"Error gestionando carpeta de logs: {e}")
 
-    log_file = os.path.join(log_dir, f"proceso_sissa_{datetime.today().strftime('%Y%m%d')}.log")
+    log_file = os.path.join(log_dir, f"{process_name}_{datetime.today().strftime('%Y%m%d')}.log")
     
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -39,33 +37,35 @@ def setup_logging(app_path, load_mode):
     console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
     logger.addHandler(console_handler)
 
-def parse_arguments(args):
-    
-    parser = argparse.ArgumentParser(description="Proceso ETL SISSA hacia Datalake PGSQL")
-    parser.add_argument('--mode', type=str, required=True, choices=['incremental', 'full'], help="Modo de carga")
-    parsed_args = parser.parse_args(args[1:])
-    return parsed_args.mode.lower()
-
-def main(args):
-
+def main():
     APP_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    LOAD_MODE = parse_arguments(args)
+    
+    parser = argparse.ArgumentParser(description="Motor ETL Basado en Metadatos")
+    parser.add_argument('--config', type=str, default='conf/config.json', help="Ruta al archivo JSON de configuración")
+    parser.add_argument('--mode', type=str, choices=['incr_fecha', 'incr_id', 'full'], default='incr_fecha', help="Modo de ejecución")
+    args = parser.parse_args()
 
-    setup_logging(APP_PATH, LOAD_MODE)
-    logging.info("="*60)
-    logging.info(f"INICIANDO PROCESO SISSA | MODO: {LOAD_MODE.upper()}")
-    logging.info("="*60)
-
-
+    # 1. Leer Configuración
     try:
-        CONF_FILE = os.path.join(APP_PATH, 'conf', 'config.json')
-        with open(CONF_FILE, 'r') as f:
+        CONF_FILE = os.path.join(APP_PATH, args.config)
+        with open(CONF_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
             
-        SRC_CONN = f"host={config['src_host']} port={config['src_port']} dbname={config['src_db']} user={config['src_user']} password={config['src_pass']}"
-        DEST_CONN = f"host={config['dest_host']} port={config['dest_port']} dbname={config['dest_db']} user={config['dest_user']} password={config['dest_pass']}"
-        
-        SQL_PATH = os.path.join(APP_PATH, 'sql', 'queries.sql')
+        process_name = config.get("process_name", "ETL_GENERICO")
+        load_mode = args.mode
+        batch_size = config.get("batch_size", 5000)
+    except Exception as e:
+        print(f"Fallo crítico leyendo config: {e}")
+        sys.exit(1)
+
+    setup_logging(APP_PATH, process_name)
+    logging.info("="*60)
+    logging.info(f"INICIANDO PROCESO: {process_name} | MODO: {load_mode.upper()}")
+    logging.info("="*60)
+
+    # 2. Cargar Consultas SQL
+    try:
+        SQL_PATH = os.path.join(APP_PATH, config["queries_file"])
         queries = {}
         with open(SQL_PATH, 'r', encoding='utf-8') as f:
             current_key = None
@@ -76,60 +76,76 @@ def main(args):
                     queries[current_key] = ""
                 elif current_key and clean_line:
                     queries[current_key] += clean_line + " "
-                    
-        logging.info("Configuración JSON y SQL cargados correctamente.")
     except Exception as e:
-        logging.error(f"Error cargando config/SQL: {e}")
+        logging.error(f"Error cargando archivo SQL: {e}")
         sys.exit(1)
 
-    query_extraccion = queries["EXTRACT_BASE"]
-    try:
-        with psycopg2.connect(DEST_CONN) as conn_dest, conn_dest.cursor() as cur_dest:
-            if LOAD_MODE == 'incremental':
-                cur_dest.execute(queries["MAX_FECHA"])
-                max_val = cur_dest.fetchone()[0]
-                ultima_fecha = max_val if max_val else '1900-01-01 00:00:00'
-                query_extraccion += f" AND \"Fecha\" > '{ultima_fecha}' ORDER BY \"Fecha\" ASC"
-                logging.info(f"Objetivo: Extraer registros con fecha > {ultima_fecha}")               
-                
-            elif LOAD_MODE == 'full':
-                logging.info("Truncando tabla destino...")
-                cur_dest.execute(queries["TRUNCATE_DESTINO"])
-                conn_dest.commit()
-                logging.info("Tabla truncada. Se extraerá la tabla origen completa.")
-    except Exception as e:
-        logging.error(f"Error preparando el modo de carga: {e}")
+    # 3. Mapear función transformadora dinámicamente
+    transformer_func = getattr(transformations, config["transformer"], None)
+    if not transformer_func:
+        logging.error(f"No se encontró la función transformadora '{config['transformer']}'.")
         sys.exit(1)
 
+    # 4. Strings de conexión
+    SRC_CONN = f"host={config['source']['host']} port={config['source']['port']} dbname={config['source']['db']} user={config['source']['user']} password={config['source']['password']}"
+    DEST_CONN = f"host={config['target']['host']} port={config['target']['port']} dbname={config['target']['db']} user={config['target']['user']} password={config['target']['password']}"
+
+    # 5. Ejecutar Motor ETL
     try:
-        logging.info("Conectando a bases para iniciar el procesamiento por lotes...")
         with psycopg2.connect(SRC_CONN) as conn_src, psycopg2.connect(DEST_CONN) as conn_dest:
-            with conn_src.cursor(name='cursor_extraccion') as cur_src, conn_dest.cursor() as cur_dest:
-                cur_src.execute(query_extraccion)
+            
+            with conn_src.cursor(name='cursor_origen', cursor_factory=DictCursor) as cur_src, conn_dest.cursor() as cur_dest:
                 
-                tamaño_lote = 5000
+
+                if load_mode == "incr_fecha":
+                    cur_dest.execute(queries["GET_LAST_VALUE_FECHA"])
+                    result = cur_dest.fetchone()
+                    last_value = result[0] if result and result[0] is not None else config["incremental"]["default_value"]
+                    logging.info(f"Buscando registros con Fecha > {last_value}")
+                    cur_src.execute(queries["EXTRACT_INCR_FECHA"], {"last_value": last_value})
+
+                elif load_mode == "incr_id":
+                    cur_dest.execute(queries["GET_LAST_VALUE_ID"])
+                    result = cur_dest.fetchone()
+
+                    last_value = result[0] if result and result[0] is not None else 0
+                    logging.info(f"Buscando registros con ID > {last_value}")
+                    cur_src.execute(queries["EXTRACT_INCR_ID"], {"last_value": last_value})
+
+                elif load_mode == "full":
+                    logging.info("Ejecutando truncado de tabla destino (PRE_LOAD)...")
+                    cur_dest.execute(queries["PRE_LOAD"])
+                    conn_dest.commit()
+                    logging.info("Extrayendo tabla de origen completa...")
+                    cur_src.execute(queries["EXTRACT_FULL"])
+
+
                 total_insertados = 0
-                
                 while True:
-                    registros = cur_src.fetchmany(tamaño_lote)
-                    if not registros: break
-                        
-                    lote_procesado = parse_sissa_records(registros)
+                    registros_raw = cur_src.fetchmany(batch_size)
+                    if not registros_raw: break
+                    
+                    lote_procesado = []
+                    for row in registros_raw:
+                        row_dict = dict(row)
+                        transformed_row = transformer_func(row_dict)
+                        if transformed_row:
+                            lote_procesado.append(transformed_row)
                     
                     if lote_procesado:
-                        execute_batch(cur_dest, queries["INSERT_DESTINO"], lote_procesado, page_size=500)
+                        execute_batch(cur_dest, queries["INSERT"], lote_procesado, page_size=500)
                         conn_dest.commit()
                         total_insertados += len(lote_procesado)
-                        logging.info(f"Procesando... Total acumulado insertado: {total_insertados}")
+                        logging.info(f"Procesando... Total acumulado: {total_insertados}")
 
         if total_insertados == 0:
             logging.info("No hubo registros nuevos para procesar.")
             
-        logging.info(f"--- FIN DEL PROCESO SISSA. Total final procesado: {total_insertados} ---")
+        logging.info(f"--- FIN DEL PROCESO. Total final: {total_insertados} ---")
 
     except Exception as e:
         logging.error(f"Error crítico en el pipeline: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
