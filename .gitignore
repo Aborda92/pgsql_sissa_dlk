@@ -4,6 +4,7 @@ __pycache__/
 
 # Logs (toda la carpeta log, no solo los .log)
 /log/
+*.log
 
 # Configuraciones sensibles
 /conf/config.json

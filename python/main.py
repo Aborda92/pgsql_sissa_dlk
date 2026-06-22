@@ -1,125 +1,135 @@
 # python/main.py
 import os
-import logging
+import sys
 import json
+import logging
+import argparse
+from datetime import datetime
 import psycopg2
 from psycopg2.extras import execute_batch
-from datetime import datetime, timedelta
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONF_PATH = os.path.join(BASE_DIR, '..', 'conf', 'config.json')
-SQL_PATH = os.path.join(BASE_DIR, '..', 'sql', 'queries.sql')
-LOG_DIR = os.path.join(BASE_DIR, '..', 'log')
+current_dir = os.path.dirname(os.path.realpath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
+from transformations import parse_sissa_records
 
-if not os.path.exists(LOG_DIR): 
-    os.makedirs(LOG_DIR)
+def setup_logging(app_path, load_mode):
 
-with open(CONF_PATH, 'r') as f:
-    config = json.load(f)
+    log_dir = os.path.join(app_path, 'logs')
+    try:
+        if not os.path.exists(log_dir): os.makedirs(log_dir)
+        archivos_log = [f for f in os.listdir(log_dir) if f.startswith('proceso_sissa_') and f.endswith('.log')]
+        archivos_log.sort()
+        while len(archivos_log) >= 7:
+            os.remove(os.path.join(log_dir, archivos_log.pop(0)))
+    except Exception as e:
+        print(f"Error gestionando carpeta de logs: {e}")
 
-NOMBRE_PROCESO = config.get("PROCESS_NAME", "ETL_SISSA")
-
-logger = logging.getLogger(NOMBRE_PROCESO)
-logger.setLevel(logging.INFO)
-log_file = os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y-%m-%d')}.log")
-
-handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-
-if not logger.handlers:
-    logger.addHandler(handler)
-    logger.addHandler(logging.StreamHandler())
-
-try:
-    fecha_limite = datetime.now() - timedelta(days=7)
-    for archivo in os.listdir(LOG_DIR):
-        ruta_archivo = os.path.join(LOG_DIR, archivo)
-        if os.path.isfile(ruta_archivo) and archivo.endswith(".log"):
-            fecha_archivo = datetime.strptime(archivo.replace(".log", ""), "%Y-%m-%d")
-            if fecha_archivo < fecha_limite:
-                os.remove(ruta_archivo)
-except Exception as e:
-    logger.warning(f"No se pudo limpiar logs antiguos: {e}")
-
-# Conexiones
-SRC_CONN = f"host={config['SRC']['HOST']} port={config['SRC']['PORT']} dbname={config['SRC']['DB']} user={config['SRC']['USER']} password={config['SRC']['PASS']}"
-DEST_CONN = f"host={config['DEST']['HOST']} port={config['DEST']['PORT']} dbname={config['DEST']['DB']} user={config['DEST']['USER']} password={config['DEST']['PASS']}"
-
-queries = {}
-try:
-    with open(SQL_PATH, 'r', encoding='utf-8') as f:
-        current_key = None
-        for line in f:
-            clean_line = line.strip()
-            if clean_line.startswith("-- name:"):
-                current_key = clean_line.replace("-- name:", "").strip()
-                queries[current_key] = ""
-            elif current_key and clean_line:
-                queries[current_key] += clean_line + " "
+    log_file = os.path.join(log_dir, f"proceso_sissa_{datetime.today().strftime('%Y%m%d')}.log")
     
-    if "QUERY_ULTIMA_FECHA" not in queries:
-        raise ValueError("No se encontró la etiqueta QUERY_ULTIMA_FECHA")
-except Exception as e:
-    logger.error(f"Error crítico cargando el archivo SQL: {e}")
-    raise
-
-def procesar_ingesta():
-
-    logger.info("="*60)
-    logger.info(f"ARRANCANDO PROCESO: {NOMBRE_PROCESO}")
-    logger.info(f"Fecha de inicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("="*60)
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers = [] 
     
+    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(file_handler)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', '%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(console_handler)
+
+def parse_arguments(args):
+    
+    parser = argparse.ArgumentParser(description="Proceso ETL SISSA hacia Datalake PGSQL")
+    parser.add_argument('--mode', type=str, required=True, choices=['incremental', 'full'], help="Modo de carga")
+    parsed_args = parser.parse_args(args[1:])
+    return parsed_args.mode.lower()
+
+def main(args):
+
+    APP_PATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    LOAD_MODE = parse_arguments(args)
+
+    setup_logging(APP_PATH, LOAD_MODE)
+    logging.info("="*60)
+    logging.info(f"INICIANDO PROCESO SISSA | MODO: {LOAD_MODE.upper()}")
+    logging.info("="*60)
+
+
+    try:
+        CONF_FILE = os.path.join(APP_PATH, 'conf', 'config.json')
+        with open(CONF_FILE, 'r') as f:
+            config = json.load(f)
+            
+        SRC_CONN = f"host={config['src_host']} port={config['src_port']} dbname={config['src_db']} user={config['src_user']} password={config['src_pass']}"
+        DEST_CONN = f"host={config['dest_host']} port={config['dest_port']} dbname={config['dest_db']} user={config['dest_user']} password={config['dest_pass']}"
+        
+        SQL_PATH = os.path.join(APP_PATH, 'sql', 'queries.sql')
+        queries = {}
+        with open(SQL_PATH, 'r', encoding='utf-8') as f:
+            current_key = None
+            for line in f:
+                clean_line = line.strip()
+                if clean_line.startswith("-- name:"):
+                    current_key = clean_line.replace("-- name:", "").strip()
+                    queries[current_key] = ""
+                elif current_key and clean_line:
+                    queries[current_key] += clean_line + " "
+                    
+        logging.info("Configuración JSON y SQL cargados correctamente.")
+    except Exception as e:
+        logging.error(f"Error cargando config/SQL: {e}")
+        sys.exit(1)
+
+    query_extraccion = queries["EXTRACT_BASE"]
     try:
         with psycopg2.connect(DEST_CONN) as conn_dest, conn_dest.cursor() as cur_dest:
-            cur_dest.execute(queries["QUERY_ULTIMA_FECHA"])
-            res = cur_dest.fetchone()
-            ultima_fecha = res[0] if res and res[0] else '1900-01-01'
-            
-        logger.info(f"Buscando registros posteriores a: {ultima_fecha}")
+            if LOAD_MODE == 'incremental':
+                cur_dest.execute(queries["MAX_FECHA"])
+                max_val = cur_dest.fetchone()[0]
+                ultima_fecha = max_val if max_val else '1900-01-01 00:00:00'
+                query_extraccion += f" AND \"Fecha\" > '{ultima_fecha}' ORDER BY \"Fecha\" ASC"
+                logging.info(f"Objetivo: Extraer registros con fecha > {ultima_fecha}")               
+                
+            elif LOAD_MODE == 'full':
+                logging.info("Truncando tabla destino...")
+                cur_dest.execute(queries["TRUNCATE_DESTINO"])
+                conn_dest.commit()
+                logging.info("Tabla truncada. Se extraerá la tabla origen completa.")
+    except Exception as e:
+        logging.error(f"Error preparando el modo de carga: {e}")
+        sys.exit(1)
 
-        with psycopg2.connect(SRC_CONN) as conn_src, conn_src.cursor() as cur_src:
-            cur_src.execute(queries["QUERY_EXTRACCION"], {"ultima_fecha": ultima_fecha})
-            registros = cur_src.fetchall()
-            
-        if not registros:
-            logger.info("No hay registros nuevos. Terminando.")
-            logger.info("--- FIN DE LA EJECUCIÓN ---")
-            return
+    try:
+        logging.info("Conectando a bases para iniciar el procesamiento por lotes...")
+        with psycopg2.connect(SRC_CONN) as conn_src, psycopg2.connect(DEST_CONN) as conn_dest:
+            with conn_src.cursor(name='cursor_extraccion') as cur_src, conn_dest.cursor() as cur_dest:
+                cur_src.execute(query_extraccion)
+                
+                tamaño_lote = 5000
+                total_insertados = 0
+                
+                while True:
+                    registros = cur_src.fetchmany(tamaño_lote)
+                    if not registros: break
+                        
+                    lote_procesado = parse_sissa_records(registros)
+                    
+                    if lote_procesado:
+                        execute_batch(cur_dest, queries["INSERT_DESTINO"], lote_procesado, page_size=500)
+                        conn_dest.commit()
+                        total_insertados += len(lote_procesado)
+                        logging.info(f"Procesando... Total acumulado insertado: {total_insertados}")
 
-        logger.info(f"Se extrajeron {len(registros)} registros nuevos. Preparando lote...")
-
-        lote = []
-        for row in registros:
-            id_o, tipo, fecha, cont, sol_id, prod_id = row
-            c_json = json.loads(cont) if isinstance(cont, str) else cont
+        if total_insertados == 0:
+            logging.info("No hubo registros nuevos para procesar.")
             
-            base = c_json if "DatosSalida" in c_json else c_json.get("FullResponse", {})
-            datos_salida = base.get("DatosSalida", {})
-            datos_entrada = base.get("DatosEntrada", {})
-            
-            personas = datos_salida.get("Personas", [])
-            duplicados = datos_salida.get("Duplicados", [])
-            fuente = personas[0] if personas else (duplicados[0] if duplicados else None)
-            
-            if fuente:
-                cuil = str(fuente.get("Cuil")) if fuente.get("Cuil") else None
-                documento = str(fuente.get("NroDoc")) if fuente.get("NroDoc") else None
-            else:
-                cuil, documento = None, str(datos_entrada.get("Documento"))
-
-            lote.append({"id": id_o, "tipo": tipo, "fecha": fecha, "solicitud_id": sol_id, 
-                         "producto_id": prod_id, "contenido": json.dumps(c_json), "cuil": cuil, "documento": documento})
-
-        with psycopg2.connect(DEST_CONN) as conn_dest, conn_dest.cursor() as cur_dest:
-            execute_batch(cur_dest, queries["QUERY_INSERCION"], lote, page_size=500)
-            conn_dest.commit()
-            
-        logger.info(f"Ingesta finalizada: {len(lote)} registros procesados.")
-        logger.info("--- FIN DE LA EJECUCIÓN ---")
+        logging.info(f"--- FIN DEL PROCESO SISSA. Total final procesado: {total_insertados} ---")
 
     except Exception as e:
-        logger.error(f"Error crítico en la ingesta: {str(e)}")
+        logging.error(f"Error crítico en el pipeline: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    procesar_ingesta()
+    main(sys.argv)
