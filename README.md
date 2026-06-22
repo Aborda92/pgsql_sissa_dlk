@@ -1,42 +1,38 @@
 # PGSQL SISSA DLK
-Motor ETL universal basado en metadatos para la ingesta de datos entre bases de datos PostgreSQL. Diseñado para alta disponibilidad, procesamiento por lotes y escalabilidad mediante configuración externa.
+Motor de ingesta de datos para el sistema SISSA. Extrae registros desde PostgreSQL, transforma los datos JSON y los ingesta en un Datalake PostgreSQL utilizando procesamiento por lotes.
 
 ## Estructura del Proyecto
-* `conf/`: Contiene los archivos de configuración JSON (ej. `config.json`).
-* `sql/`: Centraliza todas las consultas SQL (`queries.sql`) parametrizadas.
-* `python/`: Contiene el orquestador principal (`main.py`) y el módulo de transformaciones dinámicas (`transformations.py`).
-* `logs/`: Directorio autogenerado para el monitoreo de ejecuciones.
+* `conf/`: Contiene el archivo de configuración con las credenciales (`config.json`).
+* `sql/`: Centraliza todas las consultas SQL (`queries.sql`) separadas por etiquetas.
+* `python/`: Contiene el orquestador principal (`main.py`) y la lógica de parseo JSON (`transformations.py`).
+* `logs/`: Directorio autogenerado donde se guardan los historiales de ejecución.
 
 ## Cómo ejecutar localmente (docker)
-1. **Construir la imagen:**
-   ```bash
-   docker build -t pgsql_sissa_dlk .
+1. Construir la imagen (ejecutar en la raíz del proyecto): 
+   `docker build -t pgsql_sissa_dlk .`
+
+2. Ejecutar el contenedor (requiere el parámetro `--mode`, si no se especifica, utiliza incr_fecha por defecto): 
    
+   **Para carga diaria o diferencial (Solo trae registros nuevos por fecha):**
+   `docker run --rm -v "${PWD}:/app" pgsql_sissa_dlk python /app/python/main.py --mode incr_fecha`
    
-2. Ejecutar el contenedor:
-El motor acepta el parámetro --mode para definir la estrategia de carga. Si no se especifica, utiliza incr_fecha por defecto.
-
-Carga incremental por fecha (Recomendada para procesos diarios):
-
-docker run --rm -v "${PWD}:/app" pgsql_sissa_dlk --mode incr_fecha
-Carga incremental por ID:
-
-docker run --rm -v "${PWD}:/app" pgsql_sissa_dlk --mode incr_id
-Recarga completa (Trunca destino y carga todo):
-
-docker run --rm -v "${PWD}:/app" pgsql_sissa_dlk --mode full
+   **Para carga diaria o diferencial (Solo trae registros nuevos por id, en este proceso no aplica):**
+   `docker run --rm -v "${PWD}:/app" pgsql_sissa_dlk python /app/python/main.py --mode incr_id`   
+   
+   **Para recarga completa (Trunca la tabla destino y carga todo desde cero):**
+   `docker run --rm -v "${PWD}:/app" pgsql_sissa_dlk python /app/python/main.py --mode full`
 
 ## Configuración
-Crea el archivo conf/config.json en la raíz del proyecto con la estructura requerida por el motor:
+Crea el archivo `conf/config.json` en la raíz del proyecto con la siguiente estructura plana:
 
-JSON
+```json
 {
     "process_name": "PGSQL_SISSA_DLK",
     "source": {
         "host": "10.19.110.80",
         "port": 5432,
-        "db": "UNZ.Ob_backend.D",
-        "user": "dev_user",
+        "db": "postgres",
+        "user": "etluser",
         "password": "tu_password"
     },
     "target": {
