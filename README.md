@@ -49,6 +49,7 @@ Crea el archivo `conf/config.json` en la raíz del proyecto con la siguiente est
     "queries_file": "sql/queries.sql",
     "transformer": "sissa_json",
     "batch_size": 5000
+    "insert_template": "(%(id)s, %(tipo)s, %(fecha)s, %(solicitud_id)s, %(producto_id)s, %(contenido)s, %(cuil)s, %(documento)s)"	
 }
 
 ## Nota sobre el desarrollo
