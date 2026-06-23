@@ -5,7 +5,7 @@ import logging
 import argparse
 from datetime import datetime
 import psycopg2
-from psycopg2.extras import execute_batch, DictCursor
+from psycopg2.extras import DictCursor, execute_values
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 if current_dir not in sys.path:
@@ -42,7 +42,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Motor ETL Basado en Metadatos")
     parser.add_argument('--config', type=str, default='conf/config.json', help="Ruta al archivo JSON de configuración")
-    parser.add_argument('--mode', type=str, choices=['incr_fecha', 'incr_id', 'full'], default='incr_fecha', help="Modo de ejecución")
+    parser.add_argument('--mode', type=str, choices=['incr_fecha', 'full'], default='incr_fecha', help="Modo de ejecución")
     args = parser.parse_args()
 
     # 1. Leer Configuración
@@ -96,21 +96,12 @@ def main():
             
             with conn_src.cursor(name='cursor_origen', cursor_factory=DictCursor) as cur_src, conn_dest.cursor() as cur_dest:
                 
-
                 if load_mode == "incr_fecha":
                     cur_dest.execute(queries["GET_LAST_VALUE_FECHA"])
                     result = cur_dest.fetchone()
                     last_value = result[0] if result and result[0] is not None else config["incremental"]["default_value"]
-                    logging.info(f"Buscando registros con Fecha > {last_value}")
+                    logging.info(f"Buscando registros con Fecha > {last_value} (solapamiento de 5 min)")
                     cur_src.execute(queries["EXTRACT_INCR_FECHA"], {"last_value": last_value})
-
-                elif load_mode == "incr_id":
-                    cur_dest.execute(queries["GET_LAST_VALUE_ID"])
-                    result = cur_dest.fetchone()
-
-                    last_value = result[0] if result and result[0] is not None else 0
-                    logging.info(f"Buscando registros con ID > {last_value}")
-                    cur_src.execute(queries["EXTRACT_INCR_ID"], {"last_value": last_value})
 
                 elif load_mode == "full":
                     logging.info("Ejecutando truncado de tabla destino (PRE_LOAD)...")
@@ -119,11 +110,26 @@ def main():
                     logging.info("Extrayendo tabla de origen completa...")
                     cur_src.execute(queries["EXTRACT_FULL"])
 
+                # Preparar query para execute_values dinámicamente
+                query_ev = queries["INSERT"]
+                
+                # Lee el template directamente desde el JSON
+                template_ev = config.get("insert_template")
+                
+                if not template_ev:
+                    logging.error("Falta definir 'insert_template' en el archivo config.json")
+                    sys.exit(1)
 
+                total_leidos = 0
+                total_transformados = 0
                 total_insertados = 0
+
                 while True:
                     registros_raw = cur_src.fetchmany(batch_size)
                     if not registros_raw: break
+                    
+                    lote_leido = len(registros_raw)
+                    total_leidos += lote_leido
                     
                     lote_procesado = []
                     for row in registros_raw:
@@ -132,16 +138,33 @@ def main():
                         if transformed_row:
                             lote_procesado.append(transformed_row)
                     
-                    if lote_procesado:
-                        execute_batch(cur_dest, queries["INSERT"], lote_procesado, page_size=500)
-                        conn_dest.commit()
-                        total_insertados += len(lote_procesado)
-                        logging.info(f"Procesando... Total acumulado: {total_insertados}")
+                    count_transformados = len(lote_procesado)
+                    total_transformados += count_transformados
+                    count_ins = 0
 
-        if total_insertados == 0:
-            logging.info("No hubo registros nuevos para procesar.")
-            
-        logging.info(f"--- FIN DEL PROCESO. Total final: {total_insertados} ---")
+                    if lote_procesado:
+                        insertados_lista = execute_values(
+                            cur_dest, 
+                            query_ev, 
+                            lote_procesado, 
+                            template=template_ev,
+                            page_size=500,
+                            fetch=True
+                        )
+                        conn_dest.commit()
+                        
+                        count_ins = len(insertados_lista) if insertados_lista else 0
+                        total_insertados += count_ins
+                        
+                    logging.info(f"Lote -> Leidos: {lote_leido} | Transf: {count_transformados} | Ins: {count_ins} | Dup: {count_transformados - count_ins}")
+
+        logging.info(
+            f"--- FIN DEL PROCESO | "
+            f"Leidos={total_leidos} | "
+            f"Transformados={total_transformados} | "
+            f"Insertados={total_insertados} | "
+            f"Duplicados={total_transformados - total_insertados} ---"
+        )
 
     except Exception as e:
         logging.error(f"Error crítico en el pipeline: {e}")
